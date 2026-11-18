@@ -1,0 +1,39 @@
+# Cluster credentials & secrets
+config/kube/
+*.kubeconfig
+*.pem
+*.key
+
+# Python environment and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Runtime data, logs and model checkpoints (kept on the experiment machine)
+data/
+.locust/
+*.log
+*.pid
+*.pt
+*.pth
+
+# Generated figures (regenerated locally from data/, not versioned)
+figures/
+
+# OS & IDE artifacts
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Windows download markers (copying files into WSL)
+*:Zone.Identifier
