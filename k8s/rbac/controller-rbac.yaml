@@ -1,0 +1,53 @@
+# controller-sa: env/injector.py fault injection + reset().
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller-sa
+  namespace: boutique
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: controller-sa-token
+  namespace: boutique
+  annotations:
+    kubernetes.io/service-account.name: controller-sa
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: controller-role
+  namespace: boutique
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: ["chaos-mesh.org"]
+    resources: ["stresschaos"]
+    verbs: ["create", "get", "list", "delete"]
+  # k8s_hpa evaluation baseline only (team-approved 2026-10-13): reset() deletes these in every
+  # reset and creates them from k8s/hpa/hpa-baseline.yaml only for k8s_hpa episodes.
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["create", "get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: controller-rolebinding
+  namespace: boutique
+subjects:
+  - kind: ServiceAccount
+    name: controller-sa
+    namespace: boutique
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: controller-role
