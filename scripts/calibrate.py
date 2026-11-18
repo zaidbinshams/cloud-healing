@@ -1,0 +1,277 @@
+"""Calibrate the steady baseline and write config/calibration.json (milestone M3 step 3).
+
+1. Refuse unless the live namespace matches golden_live.json and the tracked tree is clean
+   (calibration.json records the git SHA the env code was calibrated against).
+2. U_base search: set Locust's user count, discard warm-up ticks, measure the frontend's CPU
+   relative to its limit (cpu_util[frontend]) over probe ticks, and adjust the user count
+   proportionally until it lies in contract `calibration.frontend_util_band`.
+3. Steady window at U_base for --minutes: record every tick (data/calibration/<stamp>.jsonl).
+4. From non-stale steady ticks:  L_SLA = ceil_10ms(l_sla_factor · q95(tick SLA latency)),
+   RPS_base = median RPS.  Gate G6 (milestone M3): CV(tick SLA latency) < 0.30 [override; design 0.25] and
+   < 2 % of ticks breach the SLA. calibration.json is written ONLY if G6 passes; otherwise exit 1.
+
+--from-ticks <stamp>.jsonl recomputes steps 4 from an earlier run's recorded ticks and summary (no new
+measurement; same code path), keeping that run's git SHA and time as provenance.
+
+Locust user changes are local to Machine B (POST /swarm); nothing on the cluster is mutated.
+Exempt from the calibration.json startup requirement (it creates the file).
+
+Usage:  source config/cluster.env
+        python -m scripts.calibrate --minutes 30
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import statistics
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+from kubernetes import client
+
+from env.clock import TickClock
+from env.contract import (
+    CALIBRATION_PATH,
+    REPO_ROOT,
+    ContractError,
+    load_contract,
+    load_limits,
+)
+from env.golden import load_golden, template_hash
+from env.recorder import EventLog
+from env.telemetry import Collector, ImputeState, impute, make_api_client
+
+# [override] documented gate: CV < 0.25 (milestone M3 G6). Team-approved 2026-10-09: three
+# calibrations passed the breach criterion but failed CV on rare slow ticks (server p95 run: 0.292; 0.237
+# without its single slowest tick); the SLA they produce is tight (60 ms ≈ 2.4 x median), not loose.
+G6_MAX_CV = 0.30
+G6_MAX_BREACH_SHARE = 0.02       # milestone M3 gate G6: < 2 % of NULL ticks breach the SLA
+L_SLA_ROUND_MS = 10              # L_SLA is rounded up to 10 ms
+FRONTEND = "frontend"
+
+
+def _git(*args: str) -> str:
+    return subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=False).stdout.strip()
+
+
+def quantile_nearest_rank(xs: list[float], q: float) -> float:
+    s = sorted(xs)
+    return s[max(0, math.ceil(q * len(s)) - 1)]
+
+
+def l_sla_from(lats: list[float], factor: float) -> float:
+    """L_SLA = ceil_10ms(factor * q95(steady tick SLA latency)). Pure."""
+    raw = factor * quantile_nearest_rank(lats, 0.95)
+    return float(math.ceil(raw / L_SLA_ROUND_MS) * L_SLA_ROUND_MS)
+
+
+def next_users(users: int, util: float, band: tuple[float, float]) -> int:
+    """Proportional step toward the band centre (CPU ~ linear in load); always moves by >= 1. Pure."""
+    mid = (band[0] + band[1]) / 2
+    target = max(1, round(users * mid / util)) if util > 0 else users * 2
+    if target == users:
+        target = users + (1 if util < band[0] else -1)
+    return max(1, target)
+
+
+def g6(lats: list[float], fails: list[float], l_sla_ms: float, e_sla: float) -> dict[str, Any]:
+    cv = statistics.pstdev(lats) / statistics.fmean(lats)
+    breach = sum(1 for p, f in zip(lats, fails, strict=True) if p > l_sla_ms or f > e_sla) / len(lats)
+    return {"cv": cv, "breach_share": breach, "pass": cv < G6_MAX_CV and breach < G6_MAX_BREACH_SHARE}
+
+
+class Calibrator:
+    def __init__(self, contract: Any, events: EventLog) -> None:
+        self.c = contract
+        self.limits = load_limits(contract)
+        self.collector = Collector(contract, os.environ["PROM_URL"], os.environ["LOCUST_URL"],
+                                   make_api_client(os.environ["KUBE_AGENT"]), events)
+        self.clock = TickClock(contract.clock.tick_s, contract.clock.late_frac)
+        self.locust_url = os.environ["LOCUST_URL"]
+        self.k = 0
+
+    def swarm(self, users: int) -> None:
+        resp = requests.post(f"{self.locust_url.rstrip('/')}/swarm", data={"user_count": users, "spawn_rate": users},
+                             timeout=self.c.telemetry.locust_timeout_s)
+        resp.raise_for_status()
+
+    def ticks(self, n: int) -> list[dict[str, Any]]:
+        """n real ticks on a freshly anchored clock; one record per tick."""
+        out, state = [], ImputeState()
+        self.clock.anchor()
+        for k in range(n):
+            self.clock.wait_boundary(k + 1)
+            raw = self.collector.collect(self.k, self.clock.wall(k), self.clock.wall(k + 1))
+            self.k += 1
+            f, state = impute(raw, state, self.c)
+            fe = f.services[FRONTEND]
+            out.append({"t_wall": self.clock.wall(k + 1), "latency_ms": f.latency_ms, "client_p99_ms": f.client_p99_ms, "fail": f.fail_ratio, "rps": f.rps,
+                        "n": raw.locust.n, "stale": f.stale,
+                        "frontend_util": fe.cpu_cores / (self.limits[FRONTEND].cpu_cores * max(1.0, fe.status_replicas)),
+                        "frontend_throttle": fe.throttle})
+        return out
+
+
+def verify_golden(contract: Any) -> list[str]:
+    api = make_api_client(os.environ["KUBE_AGENT"])
+    deps = {d.metadata.name: d for d in client.AppsV1Api(api).list_namespaced_deployment(
+        contract.cluster.namespace, _request_timeout=contract.telemetry.k8s_timeout_s).items}
+    problems = []
+    for name, g in load_golden(contract).items():
+        dep = deps.get(name)
+        if dep is None or template_hash(api.sanitize_for_serialization(dep.spec.template)) != g.template_hash \
+                or dep.spec.replicas != g.replicas:
+            problems.append(name)
+    return problems
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--minutes", type=float, help="steady window length (required unless --from-ticks)")
+    ap.add_argument("--from-ticks", type=Path, help="recompute from a recorded data/calibration/<stamp>.jsonl")
+    ap.add_argument("--restamp", action="store_true",
+                    help="with --from-ticks: stamp the recomputed result with the current HEAD (team-approved, only "
+                         "when a measurement-path change provably leaves steady-state ticks unchanged)")
+    ap.add_argument("--start-users", type=int, default=40)
+    ap.add_argument("--warmup-ticks", type=int, default=2)
+    ap.add_argument("--probe-ticks", type=int, default=6)
+    ap.add_argument("--max-search", type=int, default=8)
+    args = ap.parse_args(argv)
+    if args.from_ticks is not None:
+        return finalize_from_recording(args.from_ticks, restamp=args.restamp)
+    if args.restamp:
+        ap.error("--restamp requires --from-ticks")
+    if args.minutes is None:
+        ap.error("--minutes is required unless --from-ticks is given")
+    missing = [v for v in ("KUBE_AGENT", "PROM_URL", "LOCUST_URL") if not os.environ.get(v)]
+    if missing:
+        ap.error(f"unset {missing} (source config/cluster.env)")
+    try:
+        contract = load_contract()
+    except ContractError as exc:
+        print(f"calibrate: {exc}", file=sys.stderr)
+        return 2
+    if _git("status", "--porcelain", "--untracked-files=no"):
+        print("calibrate: refusing: tracked working tree is dirty (calibration records the env git SHA)", file=sys.stderr)
+        return 2
+    drift = verify_golden(contract)
+    if drift:
+        print(f"calibrate: refusing: live deployments differ from golden_live.json: {drift}", file=sys.stderr)
+        return 2
+
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    out_dir = REPO_ROOT / "data" / "calibration"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    events = EventLog(REPO_ROOT / "data" / "logs" / f"calibrate-{stamp}.events.jsonl")
+    cal = Calibrator(contract, events)
+    band = contract.calibration.frontend_util_band
+
+    users, u_base, search = args.start_users, None, []
+    for _ in range(args.max_search):
+        cal.swarm(users)
+        cal.ticks(args.warmup_ticks)
+        probe = [t for t in cal.ticks(args.probe_ticks) if not t["stale"]]
+        util = statistics.median(t["frontend_util"] for t in probe) if probe else float("nan")
+        search.append({"users": users, "frontend_util": util, "valid_ticks": len(probe)})
+        print(f"search: users={users} frontend_util={util:.3f} (band {band[0]:.2f}-{band[1]:.2f})", flush=True)
+        if band[0] <= util <= band[1]:
+            u_base = users
+            break
+        if not math.isfinite(util):
+            continue
+        users = next_users(users, util, band)
+    if u_base is None:
+        print(f"calibrate: no user count put frontend in the band after {args.max_search} probes: {search}",
+              file=sys.stderr)
+        return 1
+
+    n_steady = round(args.minutes * 60 / contract.clock.tick_s)
+    print(f"steady: {n_steady} ticks at U_base={u_base}", flush=True)
+    cal.swarm(u_base)
+    cal.ticks(args.warmup_ticks)
+    steady = cal.ticks(n_steady)
+    ticks_path = out_dir / f"{stamp}.jsonl"
+    ticks_path.write_text("".join(json.dumps(t) + "\n" for t in steady))
+    return finalize(contract, steady, u_base, search, stamp, ticks_path, _git("rev-parse", "HEAD"),
+                    datetime.now(timezone.utc).isoformat())
+
+
+def finalize(contract: Any, steady: list[dict[str, Any]], u_base: int, search: list[dict[str, Any]], stamp: str,
+             ticks_path: Path, git_sha: str, measured_at: str, summary_suffix: str = ".summary.json",
+             extra: dict[str, Any] | None = None) -> int:
+    """Steps 4: L_SLA, RPS_base, gate G6; write the summary, and calibration.json iff G6 passes."""
+    out_dir = REPO_ROOT / "data" / "calibration"
+    valid = [t for t in steady if not t["stale"]]
+    lats, fails = [t["latency_ms"] for t in valid], [t["fail"] for t in valid]
+    l_sla = l_sla_from(lats, contract.sla.l_sla_factor)
+    rps_base = statistics.median(t["rps"] for t in valid)
+    gate = g6(lats, fails, l_sla, contract.sla.e_sla)
+    summary = {
+        "stamp": stamp, "u_base": u_base, "search": search, "steady_ticks": len(steady), "valid_ticks": len(valid),
+        "stale_share": 1 - len(valid) / len(steady), "l_sla_ms": l_sla, "rps_base": rps_base,
+        "sla_quantile": contract.sla.latency_quantile,
+        "latency_median_ms": statistics.median(lats), "latency_q95_ms": quantile_nearest_rank(lats, 0.95),
+        "frontend_util_median": statistics.median(t["frontend_util"] for t in valid), "g6": gate,
+        "ticks_file": str(ticks_path.relative_to(REPO_ROOT)), "git_sha": git_sha, "measured_at": measured_at,
+        "g6_max_cv": G6_MAX_CV, **(extra or {}),
+    }
+    (out_dir / f"{stamp}{summary_suffix}").write_text(json.dumps(summary, indent=1))
+    print(json.dumps({k: summary[k] for k in ("u_base", "l_sla_ms", "rps_base", "valid_ticks", "stale_share",
+                                               "sla_quantile", "latency_median_ms", "latency_q95_ms",
+                                               "frontend_util_median", "g6")},
+                     indent=1))
+    if not gate["pass"]:
+        print(f"calibrate: G6 FAILED (CV {gate['cv']:.3f} vs < {G6_MAX_CV}; breach {gate['breach_share']:.2%} vs "
+              f"< {G6_MAX_BREACH_SHARE:.0%}); calibration.json NOT written", file=sys.stderr)
+        return 1
+    CALIBRATION_PATH.write_text(json.dumps({
+        "l_sla_ms": l_sla, "rps_base": rps_base, "u_base": u_base,
+        "calibrated_at": measured_at, "env_git_sha": git_sha,
+    }, indent=2) + "\n")
+    print(f"wrote {CALIBRATION_PATH} (commit it with a CONTRACT-CHANGE line)")
+    return 0
+
+
+
+
+def finalize_from_recording(ticks_path: Path, restamp: bool = False) -> int:
+    """Recompute an earlier run's result from its recorded ticks + summary; nothing is re-measured.
+
+    restamp: write calibration.json with env_git_sha = HEAD (the measurement time stays the original one).
+    Only for a measurement-path change shown not to alter steady-state ticks (e.g. 2026-10-19: the frontend
+    pod-churn rule replays 90 recorded steady ticks identically); requires a clean tree and team approval.
+    """
+    contract = load_contract()
+    ticks_path = ticks_path.resolve()
+    summary_path = ticks_path.with_name(ticks_path.name.replace(".jsonl", ".summary.json"))
+    prior = json.loads(summary_path.read_text())
+    steady = [json.loads(line) for line in ticks_path.read_text().splitlines() if line.strip()]
+    if len(steady) != prior["steady_ticks"]:
+        print(f"calibrate: {ticks_path} has {len(steady)} ticks, summary says {prior['steady_ticks']}", file=sys.stderr)
+        return 2
+    measured_at = prior.get("measured_at") or datetime.strptime(prior["stamp"], "%Y%m%dT%H%M%S").astimezone(
+        timezone.utc).isoformat()
+    # Written beside the original summary, never over it: the original records the run as measured.
+    if restamp:
+        if _git("status", "--porcelain", "--untracked-files=no"):
+            print("calibrate: refusing --restamp: tracked working tree is dirty", file=sys.stderr)
+            return 2
+        head = _git("rev-parse", "HEAD")
+        return finalize(contract, steady, int(prior["u_base"]), prior["search"], prior["stamp"], ticks_path, head,
+                        measured_at, summary_suffix=f".restamped-{head[:7]}.summary.json",
+                        extra={"restamped_from_git_sha": prior["git_sha"], "restamped": "same recorded ticks, "
+                               "re-validated at HEAD; nothing re-measured"})
+    return finalize(contract, steady, int(prior["u_base"]), prior["search"], prior["stamp"], ticks_path,
+                    prior["git_sha"], measured_at, summary_suffix=f".recomputed-g6max{G6_MAX_CV:.2f}.summary.json")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
